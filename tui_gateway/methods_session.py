@@ -548,6 +548,66 @@ def _(rid, params: dict) -> dict:
                         logger.exception(
                             "stranded-session adoption failed for %s", target
                         )
+                # Cross-profile fallback for desktop resume calls that arrive
+                # WITHOUT ``profile`` (renderer routing gap): the machine-level
+                # backend only knows its launch profile's store, so a chat that
+                # lives in another profile 4007s ("session not found") even
+                # though the row is intact. Scan the other local profiles and
+                # resume from whichever store actually owns the id. Gated to
+                # source=desktop so CLI/other callers keep strict 4007 behavior.
+                if (
+                    not found
+                    and profile_home is None
+                    and str(params.get("source") or "") == "desktop"
+                ):
+                    try:
+                        from pathlib import Path
+
+                        from hermes_cli import profiles as profiles_mod
+                        from hermes_constants import get_hermes_home
+                        from hermes_state import SessionDB
+
+                        launch_home = Path(get_hermes_home()).resolve()
+                        for cand_name in profiles_mod.list_profile_names():
+                            try:
+                                cand_home = Path(profiles_mod.get_profile_dir(cand_name))
+                            except Exception:
+                                continue
+                            if cand_home.resolve() == launch_home:
+                                continue
+                            cand_db_path = cand_home / "state.db"
+                            if not cand_db_path.exists():
+                                continue
+                            cand_db = None
+                            try:
+                                cand_db = SessionDB(db_path=cand_db_path)
+                                row = cand_db.get_session(target)
+                            except Exception:
+                                row = None
+                            if row is None or row.get("archived"):
+                                if cand_db is not None:
+                                    with contextlib.suppress(Exception):
+                                        cand_db.close()
+                                continue
+                            # Adopt this profile's store for the rest of the call.
+                            if owns_db and db is not None:
+                                with contextlib.suppress(Exception):
+                                    db.close()
+                            db = cand_db
+                            owns_db = True
+                            profile_home = cand_home
+                            found = row
+                            logger.info(
+                                "cross-profile resume fallback: session %s served "
+                                "from profile %s",
+                                target,
+                                cand_name,
+                            )
+                            break
+                    except Exception:
+                        logger.exception(
+                            "cross-profile resume fallback failed for %s", target
+                        )
                 if not found:
                     return _err(rid, 4007, "session not found")
 
