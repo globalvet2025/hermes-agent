@@ -569,6 +569,62 @@ def _resume_adopt_stranded(ctx: _Resume) -> None:
         logger.exception("stranded-session adoption failed for %s", ctx.target)
 
 
+def _resume_cross_profile_fallback(ctx: _Resume) -> None:
+    """Cross-profile fallback for desktop resume calls that arrive WITHOUT ``profile``
+    (renderer routing gap): the machine-level backend only knows its launch profile's
+    store, so a chat that lives in another profile 4007s ("session not found") even
+    though the row is intact. Scan the other local profiles and resume from whichever
+    store actually owns the id. Gated to source=desktop so CLI/other callers keep
+    strict 4007 behavior."""
+    if ctx.found or ctx.profile_home is not None:
+        return
+    if str(ctx.params.get("source") or "") != "desktop":
+        return
+    try:
+        from pathlib import Path
+
+        from hermes_cli import profiles as profiles_mod
+        from hermes_constants import get_hermes_home
+        from hermes_state_registry import acquire, release_or_close
+
+        launch_home = Path(get_hermes_home()).resolve()
+        for cand_name in profiles_mod.list_profile_names():
+            try:
+                cand_home = Path(profiles_mod.get_profile_dir(cand_name))
+            except Exception:
+                continue
+            if cand_home.resolve() == launch_home:
+                continue
+            cand_db_path = cand_home / "state.db"
+            if not cand_db_path.exists():
+                continue
+            cand_db = None
+            try:
+                cand_db = acquire(cand_db_path)
+                row = cand_db.get_session(ctx.target)
+            except Exception:
+                row = None
+            if row is None or row.get("archived"):
+                if cand_db is not None:
+                    with contextlib.suppress(Exception):
+                        release_or_close(cand_db)
+                continue
+            # Adopt this profile's store for the rest of the call.
+            ctx.db = cand_db
+            ctx.owns_db = True
+            ctx.profile_home = cand_home
+            ctx.found = row
+            ctx.target = row["id"]
+            logger.info(
+                "cross-profile resume fallback: session %s served from profile %s",
+                ctx.target,
+                cand_name,
+            )
+            return
+    except Exception:
+        logger.exception("cross-profile resume fallback failed for %s", ctx.target)
+
+
 def _resume_locate(ctx: _Resume) -> dict | None:
     """Resolve ``ctx.target`` to a stored row (``ctx.found``); a dict is an early response."""
     ctx.found = ctx.db.get_session(ctx.target)
@@ -588,6 +644,7 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         return _resume_live_unpersisted(ctx, live_sid, live)
     if ctx.owns_db:
         _resume_adopt_stranded(ctx)
+    _resume_cross_profile_fallback(ctx)
     return None if ctx.found else _err(ctx.rid, 4007, "session not found")
 
 
